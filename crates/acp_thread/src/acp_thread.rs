@@ -2165,7 +2165,7 @@ impl AcpThread {
 
         let tool_call_id = tool_call.tool_call_id.clone();
         self.upsert_tool_call_inner(tool_call, status, cx)?;
-        cx.emit(AcpThreadEvent::QuestionnaireRequested(tool_call_id));
+        cx.emit(AcpThreadEvent::QuestionnaireRequested(tool_call_id.clone()));
 
         Ok(cx.spawn(async move |this, cx| {
             let answers = rx.await.ok();

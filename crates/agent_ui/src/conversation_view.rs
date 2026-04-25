@@ -2,7 +2,7 @@ use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
     AuthRequired, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
     PermissionOptions, PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus,
-    ToolCall, ToolCallContent, ToolCallStatus, UserMessageId, UserQuestion,
+    ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
@@ -1675,6 +1675,10 @@ impl ConversationView {
                 cx.notify();
             }
             AcpThreadEvent::PromptUpdated => {
+                cx.notify();
+            }
+            AcpThreadEvent::QuestionnaireRequested(_)
+            | AcpThreadEvent::QuestionnaireAnswered(_) => {
                 cx.notify();
             }
         }

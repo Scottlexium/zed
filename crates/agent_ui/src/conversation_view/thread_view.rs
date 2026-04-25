@@ -1804,7 +1804,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text_input = cx.new(|cx| Editor::auto_height(4, window, cx));
+        let text_input = cx.new(|cx| Editor::auto_height(1, 4, window, cx));
         self.questionnaire_states.insert(
             tool_call_id,
             QuestionnaireWizardState {

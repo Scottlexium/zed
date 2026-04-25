@@ -76,7 +76,6 @@ impl AgentTool for AskQuestionsTool {
 
             let answers = cx
                 .update(|cx| event_stream.ask_user_questions(questions, cx))
-                .map_err(|e| format!("Failed to ask questions: {e}"))?
                 .await
                 .map_err(|e| format!("Questions cancelled: {e}"))?;
 

@@ -674,9 +674,17 @@ pub enum ThreadEvent {
     ToolCallUpdate(acp_thread::ToolCallUpdate),
     Plan(acp::Plan),
     ToolCallAuthorization(ToolCallAuthorization),
+    UserQuestionnaire(UserQuestionnaire),
     SubagentSpawned(acp::SessionId),
     Retry(acp_thread::RetryStatus),
     Stop(acp::StopReason),
+}
+
+#[derive(Debug)]
+pub struct UserQuestionnaire {
+    pub tool_call: acp::ToolCallUpdate,
+    pub questions: Vec<acp_thread::UserQuestion>,
+    pub response: oneshot::Sender<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -3837,6 +3845,55 @@ impl ToolCallEventStream {
         let title = title.into();
         let options = context.build_permission_options();
         self.run_authorization_loop(title, options, Some(context), None, cx)
+    }
+
+    /// Asks the user a series of questions and suspends until the user submits
+    /// answers (or returns `Err` if the tool call is cancelled).
+    pub fn ask_user_questions(
+        &self,
+        questions: Vec<acp_thread::UserQuestion>,
+        cx: &mut App,
+    ) -> Task<Result<Vec<String>>> {
+        let (response_tx, response_rx) = oneshot::channel::<Vec<String>>();
+
+        let tool_call = acp::ToolCallUpdate::new(
+            self.tool_use_id.to_string(),
+            acp::ToolCallUpdateFields::new().title("Asking questions"),
+        );
+
+        let questionnaire = UserQuestionnaire {
+            tool_call,
+            questions,
+            response: response_tx,
+        };
+
+        if self
+            .stream
+            .0
+            .unbounded_send(Ok(ThreadEvent::UserQuestionnaire(questionnaire)))
+            .is_err()
+        {
+            return Task::ready(Err(anyhow::anyhow!("Thread event stream closed")));
+        }
+
+        let mut cancellation_rx = self.cancellation_rx.clone();
+        cx.spawn(async move |_cx| {
+            futures::select_biased! {
+                result = response_rx.fuse() => {
+                    result.map_err(|_| anyhow::anyhow!("Questionnaire response channel closed"))
+                }
+                _ = async {
+                    loop {
+                        if *cancellation_rx.borrow() { return; }
+                        if cancellation_rx.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }.fuse() => {
+                    Err(anyhow::anyhow!("Tool call was cancelled"))
+                }
+            }
+        })
     }
 
     /// Prompts the user for authorization.

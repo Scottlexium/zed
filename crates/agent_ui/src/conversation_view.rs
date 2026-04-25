@@ -2,7 +2,7 @@ use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
     AuthRequired, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
     PermissionOptions, PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus,
-    ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
+    ToolCall, ToolCallContent, ToolCallStatus, UserMessageId, UserQuestion,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
@@ -289,7 +289,9 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
-                    | AcpThreadEvent::PromptUpdated => {}
+                    | AcpThreadEvent::PromptUpdated
+                    | AcpThreadEvent::QuestionnaireRequested(_)
+                    | AcpThreadEvent::QuestionnaireAnswered(_) => {}
                 }
             }
         });
@@ -479,7 +481,9 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
-        | AcpThreadEvent::PromptUpdated => false,
+        | AcpThreadEvent::PromptUpdated
+        | AcpThreadEvent::QuestionnaireRequested(_)
+        | AcpThreadEvent::QuestionnaireAnswered(_) => false,
     }
 }
 

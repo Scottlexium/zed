@@ -21,6 +21,12 @@ use workspace::SERIALIZATION_THROTTLE_TIME;
 
 use super::*;
 
+struct QuestionnaireWizardState {
+    current_step: usize,
+    answers: Vec<String>,
+    text_input: Entity<Editor>,
+}
+
 #[derive(Default)]
 struct ThreadFeedbackState {
     feedback: Option<ThreadFeedback>,
@@ -329,6 +335,7 @@ pub struct ThreadView {
     pub show_codex_windows_warning: bool,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
+    questionnaire_states: HashMap<acp::ToolCallId, QuestionnaireWizardState>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -459,6 +466,16 @@ impl ThreadView {
         ));
 
         subscriptions.push(cx.subscribe_in(
+            &thread,
+            window,
+            |this: &mut Self, _thread, event: &AcpThreadEvent, window, cx| {
+                if let AcpThreadEvent::QuestionnaireRequested(id) = event {
+                    this.init_questionnaire(id.clone(), window, cx);
+                }
+            },
+        ));
+
+        subscriptions.push(cx.subscribe_in(
             &message_editor,
             window,
             Self::handle_message_editor_event,
@@ -553,6 +570,7 @@ impl ThreadView {
             show_codex_windows_warning,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            questionnaire_states: HashMap::default(),
         };
 
         this.sync_generating_indicator(cx);
@@ -1778,6 +1796,135 @@ impl ThreadView {
             window,
             cx,
         );
+    }
+
+    fn init_questionnaire(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text_input = cx.new(|cx| Editor::auto_height(4, window, cx));
+        self.questionnaire_states.insert(
+            tool_call_id,
+            QuestionnaireWizardState {
+                current_step: 0,
+                answers: Vec::new(),
+                text_input,
+            },
+        );
+        cx.notify();
+    }
+
+    fn questionnaire_select_option(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        question_count: usize,
+        answer: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.questionnaire_states.get_mut(&tool_call_id) else {
+            return;
+        };
+
+        let step = state.current_step;
+        if step >= state.answers.len() {
+            state.answers.resize(step + 1, String::new());
+        }
+        state.answers[step] = answer.clone();
+
+        let is_last = step + 1 >= question_count;
+        if is_last {
+            let answers = state.answers.clone();
+            self.questionnaire_states.remove(&tool_call_id);
+            self.thread.update(cx, |thread, cx| {
+                thread.answer_questions(tool_call_id, answers, cx);
+            });
+        } else {
+            state.current_step += 1;
+            let next_answer = state.answers.get(state.current_step).cloned().unwrap_or_default();
+            state.text_input.update(cx, |editor, cx| {
+                editor.set_text(next_answer, window, cx);
+            });
+            cx.notify();
+        }
+    }
+
+    fn questionnaire_next_step(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        question_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input_text = {
+            let Some(state) = self.questionnaire_states.get(&tool_call_id) else {
+                return;
+            };
+            state.text_input.read(cx).text(cx).to_string()
+        };
+
+        let Some(state) = self.questionnaire_states.get_mut(&tool_call_id) else {
+            return;
+        };
+
+        let step = state.current_step;
+        if step >= state.answers.len() {
+            state.answers.resize(step + 1, String::new());
+        }
+        state.answers[step] = input_text;
+
+        let is_last = step + 1 >= question_count;
+        if is_last {
+            let answers = state.answers.clone();
+            self.questionnaire_states.remove(&tool_call_id);
+            self.thread.update(cx, |thread, cx| {
+                thread.answer_questions(tool_call_id, answers, cx);
+            });
+        } else {
+            state.current_step += 1;
+            let next_answer = state.answers.get(state.current_step).cloned().unwrap_or_default();
+            state.text_input.update(cx, |editor, cx| {
+                editor.set_text(next_answer, window, cx);
+            });
+            cx.notify();
+        }
+    }
+
+    fn questionnaire_back(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input_text = {
+            let Some(state) = self.questionnaire_states.get(&tool_call_id) else {
+                return;
+            };
+            state.text_input.read(cx).text(cx).to_string()
+        };
+
+        let Some(state) = self.questionnaire_states.get_mut(&tool_call_id) else {
+            return;
+        };
+
+        let step = state.current_step;
+        if step == 0 {
+            return;
+        }
+
+        if step >= state.answers.len() {
+            state.answers.resize(step + 1, String::new());
+        }
+        state.answers[step] = input_text;
+
+        state.current_step -= 1;
+        let prev_answer = state.answers.get(state.current_step).cloned().unwrap_or_default();
+        state.text_input.update(cx, |editor, cx| {
+            editor.set_text(prev_answer, window, cx);
+        });
+        cx.notify();
     }
 
     pub fn handle_select_permission_granularity(
@@ -6301,6 +6448,10 @@ impl ThreadView {
             tool_call.status,
             ToolCallStatus::WaitingForConfirmation { .. }
         );
+        let needs_question_answers = matches!(
+            tool_call.status,
+            ToolCallStatus::WaitingForQuestionAnswer { .. }
+        );
         let is_terminal_tool = matches!(tool_call.kind, acp::ToolKind::Execute);
 
         let is_edit =
@@ -6323,13 +6474,13 @@ impl ThreadView {
             })
             .unwrap_or_else(|| (false, false, focus_handle.clone()));
 
-        let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
+        let use_card_layout = needs_confirmation || needs_question_answers || is_edit || is_terminal_tool;
 
         let has_image_content = tool_call.content.iter().any(|c| c.image().is_some());
         let is_collapsible = !tool_call.content.is_empty() && !needs_confirmation;
         let mut is_open = self.expanded_tool_calls.contains(&tool_call.id);
 
-        is_open |= needs_confirmation;
+        is_open |= needs_confirmation || needs_question_answers;
 
         let should_show_raw_input = !is_terminal_tool && !is_edit && !has_image_content;
 
@@ -6441,6 +6592,14 @@ impl ThreadView {
                         cx,
                     ))
                     .into_any(),
+                ToolCallStatus::WaitingForQuestionAnswer { questions, .. } => {
+                    self.render_questionnaire(
+                        tool_call.id.clone(),
+                        questions,
+                        cx,
+                    )
+                    .into_any()
+                }
                 ToolCallStatus::Pending | ToolCallStatus::InProgress
                     if is_edit
                         && tool_call.content.is_empty()
@@ -6703,6 +6862,108 @@ impl ThreadView {
                 }
             })
             .children(tool_output_display)
+    }
+
+    fn render_questionnaire(
+        &self,
+        tool_call_id: acp::ToolCallId,
+        questions: &[acp_thread::UserQuestion],
+        cx: &Context<Self>,
+    ) -> Div {
+        let Some(state) = self.questionnaire_states.get(&tool_call_id) else {
+            return div();
+        };
+
+        let current_step = state.current_step;
+        let question_count = questions.len();
+        let Some(question) = questions.get(current_step) else {
+            return div();
+        };
+
+        let text_input = state.text_input.clone();
+        let is_last = current_step + 1 >= question_count;
+        let can_go_back = current_step > 0;
+
+        let progress_label = if question_count > 1 {
+            format!("Question {} of {}", current_step + 1, question_count)
+        } else {
+            String::new()
+        };
+
+        v_flex()
+            .w_full()
+            .p_3()
+            .gap_3()
+            .when(!progress_label.is_empty(), |this| {
+                this.child(
+                    Label::new(progress_label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                Label::new(question.text.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Default),
+            )
+            .when(!question.options.is_empty(), |this| {
+                this.child(
+                    h_flex().flex_wrap().gap_1p5().children(
+                        question.options.iter().cloned().map(|option| {
+                            let id = tool_call_id.clone();
+                            let opt = option.clone();
+                            let count = question_count;
+                            Button::new(
+                                SharedString::from(format!("option-{}", option)),
+                                option,
+                            )
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .on_click(cx.listener(move |this, _event, window, cx| {
+                                this.questionnaire_select_option(
+                                    id.clone(),
+                                    count,
+                                    opt.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }))
+                        }),
+                    ),
+                )
+            })
+            .child(
+                div()
+                    .p_2()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    .child(text_input.clone()),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .when(can_go_back, |this| {
+                        let id = tool_call_id.clone();
+                        this.child(
+                            Button::new("questionnaire-back", "Back")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    this.questionnaire_back(id.clone(), window, cx);
+                                })),
+                        )
+                    })
+                    .child({
+                        let id = tool_call_id.clone();
+                        let count = question_count;
+                        let label = if is_last { "Submit" } else { "Next" };
+                        Button::new("questionnaire-next", label)
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .on_click(cx.listener(move |this, _event, window, cx| {
+                                this.questionnaire_next_step(id.clone(), count, window, cx);
+                            }))
+                    }),
+            )
     }
 
     fn render_permission_buttons(
@@ -7823,6 +8084,7 @@ impl ThreadView {
             ToolCallStatus::Pending
                 | ToolCallStatus::InProgress
                 | ToolCallStatus::WaitingForConfirmation { .. }
+                | ToolCallStatus::WaitingForQuestionAnswer { .. }
         );
 
         let is_failed = matches!(

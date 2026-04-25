@@ -1317,6 +1317,28 @@ impl NativeAgentConnection {
                                 })
                                 .detach();
                             }
+                            ThreadEvent::UserQuestionnaire(UserQuestionnaire {
+                                tool_call,
+                                questions,
+                                response,
+                            }) => {
+                                let answer_task = acp_thread.update(cx, |thread, cx| {
+                                    thread.request_question_answers(tool_call, questions, cx)
+                                })??;
+                                cx.background_spawn(async move {
+                                    if let Some(answers) = answer_task.await {
+                                        response
+                                            .send(answers)
+                                            .map_err(|_| {
+                                                anyhow::anyhow!(
+                                                    "questionnaire response receiver was dropped"
+                                                )
+                                            })
+                                            .log_err();
+                                    }
+                                })
+                                .detach();
+                            }
                             ThreadEvent::ToolCall(tool_call) => {
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.upsert_tool_call(tool_call, cx)

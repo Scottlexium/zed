@@ -565,6 +565,15 @@ impl From<RequestPermissionOutcome> for acp::RequestPermissionOutcome {
     }
 }
 
+/// A single question the agent asks the user, optionally with suggested answers.
+#[derive(Debug, Clone)]
+pub struct UserQuestion {
+    /// The question text shown to the user.
+    pub text: String,
+    /// Optional suggested answers. The user may also type a custom answer.
+    pub options: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum ToolCallStatus {
     /// The tool call hasn't started running yet, but we start showing it to
@@ -574,6 +583,11 @@ pub enum ToolCallStatus {
     WaitingForConfirmation {
         options: PermissionOptions,
         respond_tx: oneshot::Sender<SelectedPermissionOutcome>,
+    },
+    /// The tool call is waiting for the user to answer a series of questions.
+    WaitingForQuestionAnswer {
+        questions: Vec<UserQuestion>,
+        respond_tx: oneshot::Sender<Vec<String>>,
     },
     /// The tool call is currently running.
     InProgress,
@@ -607,6 +621,7 @@ impl Display for ToolCallStatus {
             match self {
                 ToolCallStatus::Pending => "Pending",
                 ToolCallStatus::WaitingForConfirmation { .. } => "Waiting for confirmation",
+                ToolCallStatus::WaitingForQuestionAnswer { .. } => "Waiting for answers",
                 ToolCallStatus::InProgress => "In Progress",
                 ToolCallStatus::Completed => "Completed",
                 ToolCallStatus::Failed => "Failed",
@@ -1107,6 +1122,8 @@ pub enum AcpThreadEvent {
     EntriesRemoved(Range<usize>),
     ToolAuthorizationRequested(acp::ToolCallId),
     ToolAuthorizationReceived(acp::ToolCallId),
+    QuestionnaireRequested(acp::ToolCallId),
+    QuestionnaireAnswered(acp::ToolCallId),
     Retry(RetryStatus),
     SubagentSpawned(acp::SessionId),
     Stopped(acp::StopReason),
@@ -2131,6 +2148,56 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
     }
 
+    /// Puts a tool call into `WaitingForQuestionAnswer` state and returns a task
+    /// that resolves once the user submits their answers (or `None` if cancelled).
+    pub fn request_question_answers(
+        &mut self,
+        tool_call: acp::ToolCallUpdate,
+        questions: Vec<UserQuestion>,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<Option<Vec<String>>>> {
+        let (tx, rx) = oneshot::channel::<Vec<String>>();
+
+        let status = ToolCallStatus::WaitingForQuestionAnswer {
+            questions,
+            respond_tx: tx,
+        };
+
+        let tool_call_id = tool_call.tool_call_id.clone();
+        self.upsert_tool_call_inner(tool_call, status, cx)?;
+        cx.emit(AcpThreadEvent::QuestionnaireRequested(tool_call_id));
+
+        Ok(cx.spawn(async move |this, cx| {
+            let answers = rx.await.ok();
+            this.update(cx, |_this, cx| {
+                cx.emit(AcpThreadEvent::QuestionnaireAnswered(tool_call_id));
+            })
+            .ok();
+            answers
+        }))
+    }
+
+    /// Called by the UI when the user has finished answering questions.
+    pub fn answer_questions(
+        &mut self,
+        id: acp::ToolCallId,
+        answers: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((ix, call)) = self.tool_call_mut(&id) else {
+            return;
+        };
+
+        let curr_status = mem::replace(&mut call.status, ToolCallStatus::InProgress);
+
+        if let ToolCallStatus::WaitingForQuestionAnswer { respond_tx, .. } = curr_status {
+            respond_tx.send(answers).ok();
+        }
+
+        cx.emit(AcpThreadEvent::QuestionnaireAnswered(id));
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
     pub fn plan(&self) -> &Plan {
         &self.plan
     }
@@ -2422,6 +2489,7 @@ impl AcpThread {
                     call.status,
                     ToolCallStatus::Pending
                         | ToolCallStatus::WaitingForConfirmation { .. }
+                        | ToolCallStatus::WaitingForQuestionAnswer { .. }
                         | ToolCallStatus::InProgress
                 );
 

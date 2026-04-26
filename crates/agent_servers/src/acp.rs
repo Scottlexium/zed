@@ -828,6 +828,10 @@ impl AcpConnection {
                                 .write_text_file(true))
                             .terminal(true)
                             .auth(acp::AuthCapabilities::new().terminal(true))
+                            .elicitation(
+                                acp::ElicitationCapabilities::new()
+                                    .form(acp::ElicitationFormCapabilities::new()),
+                            )
                             .meta(acp::Meta::from_iter([
                                 ("terminal_output".into(), true.into()),
                                 ("terminal-auth".into(), true.into()),

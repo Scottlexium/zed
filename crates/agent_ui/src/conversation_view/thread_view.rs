@@ -336,6 +336,7 @@ pub struct ThreadView {
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
     questionnaire_states: HashMap<acp::ToolCallId, QuestionnaireWizardState>,
+    pub plan_mode: bool,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -571,6 +572,7 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
             questionnaire_states: HashMap::default(),
+            plan_mode: false,
         };
 
         this.sync_generating_indicator(cx);
@@ -1007,6 +1009,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let contents = self.resolve_message_contents(&message_editor, cx);
+        let plan_mode = self.plan_mode;
 
         self.thread_error.take();
         self.thread_feedback.clear();
@@ -1021,10 +1024,21 @@ impl ThreadView {
         }
 
         let contents_task = cx.spawn_in(window, async move |_this, cx| {
-            let (contents, tracked_buffers) = contents.await?;
+            let (mut contents, tracked_buffers) = contents.await?;
 
             if contents.is_empty() {
                 return Ok(None);
+            }
+
+            if plan_mode {
+                let plan_prefix = acp::ContentBlock::Text(acp::TextContent::new(
+                    "[Plan Mode] Before making any changes or writing any code, \
+                    gather requirements from the user. Use the ask_questions tool \
+                    (or request_user_input / elicitation) to ask at least 3 focused \
+                    questions with suggested options. Do not implement anything until \
+                    the user has confirmed their choices.\n\n",
+                ));
+                contents.insert(0, plan_prefix);
             }
 
             let _ = cx.update(|window, cx| {
@@ -3418,7 +3432,8 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .children(self.render_thinking_control(cx))
+                                    .child(self.render_plan_mode_control(cx)),
                             )
                             .child(
                                 h_flex()
@@ -4093,6 +4108,32 @@ impl ThreadView {
                 y: px(-2.0),
             })
             .anchor(gpui::Anchor::BottomLeft)
+    }
+
+    fn render_plan_mode_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, color, tooltip) = if self.plan_mode {
+            (
+                IconName::BoltFilled,
+                Color::Accent,
+                "Disable Plan Mode — agent will execute directly",
+            )
+        } else {
+            (
+                IconName::BoltOutlined,
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+                "Enable Plan Mode — agent will ask questions before executing",
+            )
+        };
+
+        IconButton::new("plan-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.plan_mode = !this.plan_mode;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_send_button(&self, cx: &mut Context<Self>) -> AnyElement {

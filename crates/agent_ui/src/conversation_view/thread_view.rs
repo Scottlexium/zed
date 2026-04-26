@@ -469,9 +469,37 @@ impl ThreadView {
         subscriptions.push(cx.subscribe_in(
             &thread,
             window,
-            |this: &mut Self, _thread, event: &AcpThreadEvent, window, cx| {
-                if let AcpThreadEvent::QuestionnaireRequested(id) = event {
-                    this.init_questionnaire(id.clone(), window, cx);
+            |this: &mut Self, thread, event: &AcpThreadEvent, window, cx| {
+                match event {
+                    AcpThreadEvent::QuestionnaireRequested(id) => {
+                        this.init_questionnaire(id.clone(), window, cx);
+                    }
+                    AcpThreadEvent::EntryUpdated(_) | AcpThreadEvent::NewEntry => {
+                        // Pick up any WaitingForQuestionAnswer entries that don't
+                        // have wizard state yet (handles race where elicitation/create
+                        // arrives before or after the session/update tool call entry).
+                        let needs_init: Vec<acp::ToolCallId> = thread
+                            .read(cx)
+                            .entries()
+                            .iter()
+                            .filter_map(|entry| {
+                                if let acp_thread::AgentThreadEntry::ToolCall(tc) = entry {
+                                    if matches!(
+                                        &tc.status,
+                                        acp_thread::ToolCallStatus::WaitingForQuestionAnswer { .. }
+                                    ) && !this.questionnaire_states.contains_key(&tc.id)
+                                    {
+                                        return Some(tc.id.clone());
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+                        for id in needs_init {
+                            this.init_questionnaire(id, window, cx);
+                        }
+                    }
+                    _ => {}
                 }
             },
         ));
@@ -3378,6 +3406,7 @@ impl ThreadView {
                     .when(fills_container, |this| this.h_full())
                     .justify_between()
                     .gap_2()
+                    .children(self.render_active_questionnaire(cx))
                     .child(
                         v_flex()
                             .relative()
@@ -4108,6 +4137,52 @@ impl ThreadView {
                 y: px(-2.0),
             })
             .anchor(gpui::Anchor::BottomLeft)
+    }
+
+    fn render_active_questionnaire(&self, cx: &Context<Self>) -> Option<Div> {
+        // Show the first pending questionnaire as a card above the input area.
+        let (tool_call_id, state) = self.questionnaire_states.iter().next()?;
+
+        // Look up the questions from the thread entries.
+        let thread = self.thread.read(cx);
+        let questions: Vec<acp_thread::UserQuestion> = thread
+            .entries()
+            .iter()
+            .find_map(|entry| {
+                if let acp_thread::AgentThreadEntry::ToolCall(tc) = entry {
+                    if &tc.id == tool_call_id {
+                        if let acp_thread::ToolCallStatus::WaitingForQuestionAnswer {
+                            questions,
+                            ..
+                        } = &tc.status
+                        {
+                            return Some(questions.clone());
+                        }
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| {
+                // Fallback: pull questions from the state itself if available.
+                Vec::new()
+            });
+
+        if questions.is_empty() {
+            // Questions not yet in thread entries — still initialising, show pending card.
+            return Some(
+                v_flex()
+                    .w_full()
+                    .p_3()
+                    .gap_2()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .child(Label::new("Preparing questions…").color(Color::Muted)),
+            );
+        }
+
+        Some(self.render_questionnaire(tool_call_id.clone(), &questions, cx))
     }
 
     fn render_plan_mode_control(&self, cx: &mut Context<Self>) -> AnyElement {

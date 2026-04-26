@@ -623,6 +623,10 @@ fn connect_client_future(
             on_request!(handle_wait_for_terminal_exit),
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            on_request!(handle_create_elicitation),
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- Notification handlers (agent→client) ---
         .on_receive_notification(
             on_notification!(handle_session_notification),
@@ -3616,6 +3620,173 @@ fn handle_wait_for_terminal_exit(
                 responder
                     .respond(acp::WaitForTerminalExitResponse::new(exit_status))
                     .log_err();
+            }
+            Err(e) => respond_err(responder, e),
+        }
+    })
+    .detach();
+}
+
+fn handle_create_elicitation(
+    args: acp::CreateElicitationRequest,
+    responder: Responder<acp::CreateElicitationResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let session_id = match args.scope() {
+        acp::ElicitationScope::Session(scope) => scope.session_id.clone(),
+        acp::ElicitationScope::Request(_) | _ => {
+            return respond_err(
+                responder,
+                acp::Error::invalid_params()
+                    .data("Request-scoped elicitation is not supported"),
+            );
+        }
+    };
+
+    let tool_call_id = match args.scope() {
+        acp::ElicitationScope::Session(scope) => scope.tool_call_id.clone(),
+        _ => None,
+    };
+
+    let thread = match session_thread(ctx, &session_id) {
+        Ok(t) => t,
+        Err(e) => return respond_err(responder, e),
+    };
+
+    let acp::ElicitationMode::Form(form) = &args.mode else {
+        return respond_err(
+            responder,
+            acp::Error::invalid_params().data("Only form-based elicitation is supported"),
+        );
+    };
+
+    // Required fields are shown first; remaining fields follow in alphabetical order.
+    let required = form.requested_schema.required.clone().unwrap_or_default();
+    let mut ordered_keys: Vec<String> = required.clone();
+    for key in form.requested_schema.properties.keys() {
+        if !required.contains(key) {
+            ordered_keys.push(key.clone());
+        }
+    }
+
+    let mut questions: Vec<acp_thread::UserQuestion> = Vec::new();
+    let mut property_names: Vec<String> = Vec::new();
+
+    if ordered_keys.is_empty() {
+        questions.push(acp_thread::UserQuestion {
+            text: args.message.clone(),
+            options: Vec::new(),
+        });
+        property_names.push("answer".to_string());
+    } else {
+        for key in &ordered_keys {
+            let Some(prop) = form.requested_schema.properties.get(key) else {
+                continue;
+            };
+            let (text, options) = match prop {
+                acp::ElicitationPropertySchema::String(s) => {
+                    let text = s
+                        .title
+                        .clone()
+                        .or_else(|| s.description.clone())
+                        .unwrap_or_else(|| key.clone());
+                    let options = if let Some(one_of) = &s.one_of {
+                        one_of.iter().map(|o| o.title.clone()).collect()
+                    } else if let Some(vals) = &s.enum_values {
+                        vals.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    (text, options)
+                }
+                acp::ElicitationPropertySchema::Boolean(b) => {
+                    let text = b
+                        .title
+                        .clone()
+                        .or_else(|| b.description.clone())
+                        .unwrap_or_else(|| key.clone());
+                    (text, vec!["Yes".to_string(), "No".to_string()])
+                }
+                acp::ElicitationPropertySchema::Number(n) => {
+                    let text = n
+                        .title
+                        .clone()
+                        .or_else(|| n.description.clone())
+                        .unwrap_or_else(|| key.clone());
+                    (text, Vec::new())
+                }
+                acp::ElicitationPropertySchema::Integer(i) => {
+                    let text = i
+                        .title
+                        .clone()
+                        .or_else(|| i.description.clone())
+                        .unwrap_or_else(|| key.clone());
+                    (text, Vec::new())
+                }
+                acp::ElicitationPropertySchema::Array(a) => {
+                    let text = a
+                        .title
+                        .clone()
+                        .or_else(|| a.description.clone())
+                        .unwrap_or_else(|| key.clone());
+                    let options = match &a.items {
+                        acp::MultiSelectItems::Untitled(u) => u.values.clone(),
+                        acp::MultiSelectItems::Titled(t) => {
+                            t.options.iter().map(|o| o.title.clone()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    (text, options)
+                }
+                _ => (key.clone(), Vec::new()),
+            };
+            questions.push(acp_thread::UserQuestion { text, options });
+            property_names.push(key.clone());
+        }
+    }
+
+    let synthetic_id = tool_call_id
+        .map(|id| id.0.to_string())
+        .unwrap_or_else(|| format!("elicitation-{}", uuid::Uuid::new_v4()));
+    let tool_call = acp::ToolCallUpdate::new(
+        synthetic_id,
+        acp::ToolCallUpdateFields::new().title(args.message.clone()),
+    );
+
+    cx.spawn(async move |cx| {
+        let result: Result<_, acp::Error> = async {
+            let answer_task = thread
+                .update(cx, |thread, cx| {
+                    thread.request_question_answers(tool_call, questions, cx)
+                })
+                .flatten_acp()?;
+
+            let answers = answer_task.await;
+
+            let response = match answers {
+                None => acp::CreateElicitationResponse::new(acp::ElicitationAction::Cancel),
+                Some(answers) => {
+                    let content: std::collections::BTreeMap<String, acp::ElicitationContentValue> =
+                        property_names
+                            .into_iter()
+                            .zip(answers)
+                            .map(|(name, answer)| {
+                                (name, acp::ElicitationContentValue::String(answer))
+                            })
+                            .collect();
+                    acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                        acp::ElicitationAcceptAction::new().content(content),
+                    ))
+                }
+            };
+            Ok(response)
+        }
+        .await;
+
+        match result {
+            Ok(response) => {
+                responder.respond(response).log_err();
             }
             Err(e) => respond_err(responder, e),
         }

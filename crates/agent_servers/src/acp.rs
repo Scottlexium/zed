@@ -3637,9 +3637,15 @@ fn handle_create_elicitation(
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
+    log::error!("[elicitation] handle_create_elicitation called, message={:?}", args.message);
+
     let session_id = match args.scope() {
-        acp::ElicitationScope::Session(scope) => scope.session_id.clone(),
+        acp::ElicitationScope::Session(scope) => {
+            log::error!("[elicitation] session scope: session_id={}, tool_call_id={:?}", scope.session_id, scope.tool_call_id);
+            scope.session_id.clone()
+        }
         acp::ElicitationScope::Request(_) | _ => {
+            log::error!("[elicitation] request scope — unsupported, returning error");
             return respond_err(
                 responder,
                 acp::Error::invalid_params()
@@ -3655,7 +3661,10 @@ fn handle_create_elicitation(
 
     let thread = match session_thread(ctx, &session_id) {
         Ok(t) => t,
-        Err(e) => return respond_err(responder, e),
+        Err(e) => {
+            log::error!("[elicitation] session_thread lookup failed: {:?}", e);
+            return respond_err(responder, e);
+        }
     };
 
     let acp::ElicitationMode::Form(form) = &args.mode else {
@@ -3758,13 +3767,17 @@ fn handle_create_elicitation(
         acp::ToolCallUpdateFields::new().title(args.message.clone()),
     );
 
+    log::error!("[elicitation] spawning handler, questions={}, synthetic_id={}", questions.len(), tool_call.tool_call_id);
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
+            log::error!("[elicitation] calling request_question_answers");
             let answer_task = thread
                 .update(cx, |thread, cx| {
+                    log::error!("[elicitation] inside thread.update");
                     thread.request_question_answers(tool_call, questions, cx)
                 })
-                .flatten_acp()?;
+                .flatten_acp()
+                .map_err(|e| { log::error!("[elicitation] request_question_answers failed: {:?}", e); e })?;
 
             let answers = answer_task.await;
 

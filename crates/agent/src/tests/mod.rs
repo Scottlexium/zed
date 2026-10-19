@@ -5417,6 +5417,10 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
     deep_subagent_thread.read_with(cx, |thread, _| {
         assert_eq!(thread.depth(), MAX_SUBAGENT_DEPTH);
         assert!(
+            thread.has_registered_tool(crate::AskQuestionsTool::NAME),
+            "ask_questions tool should be present in default tools"
+        );
+        assert!(
             !thread.has_registered_tool(SpawnAgentTool::NAME),
             "subagent tool should not be present at max depth"
         );

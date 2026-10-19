@@ -1102,6 +1102,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "copy_path": true,
+          "ask_questions": true,
           "create_directory": true,
           "delete_path": true,
           "diagnostics": true,
@@ -1130,6 +1131,7 @@
         // "enable_all_context_servers": true,
         "tools": {
           "diagnostics": true,
+          "ask_questions": true,
           "fetch": true,
           "list_directory": true,
           "project_notifications": false,

@@ -1,5 +1,5 @@
 use crate::{
-    ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
+    AskQuestionsTool, ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
     RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
@@ -1570,6 +1570,7 @@ impl Thread {
         self.add_tool(MovePathTool::new(self.project.clone()));
         self.add_tool(NowTool);
         self.add_tool(OpenTool::new(self.project.clone()));
+        self.add_tool(AskQuestionsTool);
         if cx.has_flag::<UpdatePlanToolFeatureFlag>() {
             self.add_tool(UpdatePlanTool);
         }

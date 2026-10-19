@@ -2164,7 +2164,10 @@ impl AcpThread {
         };
 
         let tool_call_id = tool_call.tool_call_id.clone();
-        self.upsert_tool_call_inner(tool_call, status, cx)?;
+        log::error!("[questionnaire] upsert_tool_call_inner with id={}", tool_call_id);
+        self.upsert_tool_call_inner(tool_call, status, cx)
+            .map_err(|e| { log::error!("[questionnaire] upsert failed: {:?}", e); anyhow::anyhow!(e) })?;
+        log::error!("[questionnaire] emitting QuestionnaireRequested id={}", tool_call_id);
         cx.emit(AcpThreadEvent::QuestionnaireRequested(tool_call_id.clone()));
 
         Ok(cx.spawn(async move |this, cx| {

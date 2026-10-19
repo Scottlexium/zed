@@ -336,6 +336,8 @@ pub struct ThreadView {
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
     questionnaire_states: HashMap<acp::ToolCallId, QuestionnaireWizardState>,
+    local_questionnaire_questions: HashMap<acp::ToolCallId, Vec<acp_thread::UserQuestion>>,
+    last_processed_plan_mode_questionnaire_source: Option<String>,
     pub plan_mode: bool,
 }
 impl Focusable for ThreadView {
@@ -472,6 +474,7 @@ impl ThreadView {
             |this: &mut Self, thread, event: &AcpThreadEvent, window, cx| {
                 match event {
                     AcpThreadEvent::QuestionnaireRequested(id) => {
+                        log::error!("[questionnaire] QuestionnaireRequested event received for id={}", id);
                         this.init_questionnaire(id.clone(), window, cx);
                     }
                     AcpThreadEvent::EntryUpdated(_) | AcpThreadEvent::NewEntry => {
@@ -498,6 +501,11 @@ impl ThreadView {
                         for id in needs_init {
                             this.init_questionnaire(id, window, cx);
                         }
+
+                        this.maybe_init_plan_mode_questionnaire(thread, window, cx);
+                    }
+                    AcpThreadEvent::Stopped(_) => {
+                        this.maybe_init_plan_mode_questionnaire(thread, window, cx);
                     }
                     _ => {}
                 }
@@ -600,6 +608,8 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
             questionnaire_states: HashMap::default(),
+            local_questionnaire_questions: HashMap::default(),
+            last_processed_plan_mode_questionnaire_source: None,
             plan_mode: false,
         };
 
@@ -1063,8 +1073,18 @@ impl ThreadView {
                     "[Plan Mode] Before making any changes or writing any code, \
                     gather requirements from the user. Use the ask_questions tool \
                     (or request_user_input / elicitation) to ask at least 3 focused \
-                    questions with suggested options. Do not implement anything until \
-                    the user has confirmed their choices.\n\n",
+                    questions with suggested options. If those tools are unavailable, \
+                    in your very next response output ONLY questions in this exact format \
+                    (no preamble text before or after) and then wait for answers: \
+                    <zed-questionnaire>\n\
+                    Q: First question text\n\
+                    Options: option A | option B | option C\n\
+                    Q: Second question text\n\
+                    Options: option A | option B | option C\n\
+                    Q: Third question text\n\
+                    Options: option A | option B | option C\n\
+                    </zed-questionnaire>\n\
+                    Do not implement anything until the user has confirmed their choices.\n\n",
                 ));
                 contents.insert(0, plan_prefix);
             }
@@ -1858,6 +1878,295 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn maybe_init_plan_mode_questionnaire(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.plan_mode || self.as_native_connection(cx).is_some() {
+            return;
+        }
+
+        let Some((entry_index, source)) = thread.read(cx).entries().iter().enumerate().rev().find_map(|(ix, entry)| {
+            let acp_thread::AgentThreadEntry::AssistantMessage(message) = entry else {
+                return None;
+            };
+
+            let source = message
+                .chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    acp_thread::AssistantMessageChunk::Message { block } => Some(block.to_markdown(cx)),
+                    acp_thread::AssistantMessageChunk::Thought { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+
+            if source.is_empty() {
+                None
+            } else {
+                Some((ix, source))
+            }
+        }) else {
+            return;
+        };
+
+        if self
+            .last_processed_plan_mode_questionnaire_source
+            .as_ref()
+            .is_some_and(|last| last == &source)
+        {
+            return;
+        }
+
+        let Some(questions) = Self::parse_plan_mode_questionnaire(&source) else {
+            self.last_processed_plan_mode_questionnaire_source = Some(source);
+            return;
+        };
+
+        self.last_processed_plan_mode_questionnaire_source = Some(source);
+
+        if let Some(active_local_questionnaire_id) = self
+            .questionnaire_states
+            .keys()
+            .find(|tool_call_id| self.local_questionnaire_questions.contains_key(*tool_call_id))
+            .cloned()
+        {
+            self.local_questionnaire_questions
+                .entry(active_local_questionnaire_id)
+                .and_modify(|existing_questions| {
+                    if questions.len() > existing_questions.len() {
+                        *existing_questions = questions.clone();
+                    }
+                });
+            cx.notify();
+            return;
+        }
+
+        if !self.questionnaire_states.is_empty() {
+            return;
+        }
+
+        let tool_call_id = acp::ToolCallId::new(format!(
+            "plan-mode-questionnaire-{entry_index}"
+        ));
+        self.init_questionnaire(tool_call_id.clone(), window, cx);
+        self.local_questionnaire_questions
+            .insert(tool_call_id, questions);
+    }
+
+    fn parse_plan_mode_questionnaire(source: &str) -> Option<Vec<acp_thread::UserQuestion>> {
+        const START: &str = "<zed-questionnaire>";
+        const END: &str = "</zed-questionnaire>";
+
+        let (body, has_markers) = if let Some(start) = source.find(START) {
+            let remaining = &source[start + START.len()..];
+            if let Some(end) = remaining.find(END) {
+                (&remaining[..end], true)
+            } else {
+                (remaining, true)
+            }
+        } else {
+            (source, false)
+        };
+
+        let mut questions = Vec::new();
+        let mut current_question: Option<acp_thread::UserQuestion> = None;
+
+        for raw_line in body.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Some(question_text) = Self::extract_question_text(line) {
+                if let Some(question) = current_question.take()
+                    && !question.text.trim().is_empty()
+                {
+                    questions.push(question);
+                }
+                current_question = Some(acp_thread::UserQuestion {
+                    text: question_text,
+                    options: Vec::new(),
+                });
+                continue;
+            }
+
+            if let Some(options_text) = Self::extract_options_text(line)
+                && let Some(question) = current_question.as_mut()
+            {
+                question.options = options_text
+                    .split('|')
+                    .map(|option| option.trim().trim_start_matches('-').trim().to_string())
+                    .filter(|option| !option.is_empty())
+                    .collect();
+                continue;
+            }
+
+            if let Some(option_text) = Self::extract_bullet_option(line)
+                && let Some(question) = current_question.as_mut()
+            {
+                question.options.push(option_text);
+            }
+        }
+
+        if let Some(question) = current_question.take()
+            && !question.text.trim().is_empty()
+        {
+            questions.push(question);
+        }
+
+        if questions.is_empty() {
+            None
+        } else if !has_markers && questions.len() < 1 {
+            None
+        } else {
+            Some(questions)
+        }
+    }
+
+    fn extract_question_text(line: &str) -> Option<String> {
+        Self::extract_prefixed_line(line, "Q:")
+            .or_else(|| Self::extract_prefixed_line(line, "Question:"))
+            .or_else(|| Self::extract_prefixed_line(line, "Question 1:"))
+            .or_else(|| Self::extract_prefixed_line(line, "Question 2:"))
+            .or_else(|| Self::extract_prefixed_line(line, "Question 3:"))
+            .or_else(|| Self::extract_numbered_question(line))
+    }
+
+    fn extract_options_text(line: &str) -> Option<String> {
+        Self::extract_prefixed_line(line, "Options:")
+            .or_else(|| Self::extract_prefixed_line(line, "Option:"))
+    }
+
+    fn extract_bullet_option(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        let option = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "))?;
+        let option = option.trim();
+        if option.is_empty() {
+            None
+        } else {
+            Some(option.to_string())
+        }
+    }
+
+    fn extract_prefixed_line(line: &str, prefix: &str) -> Option<String> {
+        if let Some(value) = line.strip_prefix(prefix) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+            return None;
+        }
+
+        let position = line.find(prefix)?;
+        let before = line[..position].trim();
+        let list_prefix = before
+            .trim_start_matches(|character: char| {
+                character.is_ascii_digit()
+                    || character == '.'
+                    || character == ')'
+                    || character == '-'
+                    || character == '*'
+                    || character.is_whitespace()
+            })
+            .trim();
+        if !list_prefix.is_empty() {
+            return None;
+        }
+
+        let value = line[position + prefix.len()..].trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+
+    fn extract_numbered_question(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        let mut split_index = 0usize;
+        let mut saw_marker = false;
+        let bytes = trimmed.as_bytes();
+        while split_index < bytes.len() {
+            let character = bytes[split_index] as char;
+            if character.is_ascii_digit()
+                || character == '.'
+                || character == ')'
+                || character == '-'
+                || character == '*'
+                || character.is_whitespace()
+            {
+                saw_marker = true;
+                split_index += 1;
+            } else {
+                break;
+            }
+        }
+
+        if !saw_marker {
+            return None;
+        }
+
+        let question = trimmed[split_index..].trim();
+        let seems_like_question = question.ends_with('?')
+            || question.contains(':')
+            || question.contains("choose")
+            || question.contains("select");
+
+        if question.is_empty() || !seems_like_question {
+            None
+        } else {
+            Some(question.to_string())
+        }
+    }
+
+    fn complete_questionnaire(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        answers: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.questionnaire_states.remove(&tool_call_id);
+
+        if let Some(questions) = self.local_questionnaire_questions.remove(&tool_call_id) {
+            let mut prompt = String::from("Here are my answers:\n");
+            for (index, answer) in answers.iter().enumerate() {
+                if let Some(question) = questions.get(index) {
+                    prompt.push_str(&format!(
+                        "{}. {}: {}\n",
+                        index + 1,
+                        question.text.trim(),
+                        answer.trim()
+                    ));
+                } else {
+                    prompt.push_str(&format!("{}. {}\n", index + 1, answer.trim()));
+                }
+            }
+
+            self.send_content(
+                Task::ready(Ok(Some((
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                    Vec::new(),
+                )))),
+                window,
+                cx,
+            );
+            return;
+        }
+
+        self.thread.update(cx, |thread, cx| {
+            thread.answer_questions(tool_call_id, answers, cx);
+        });
+    }
+
     fn questionnaire_select_option(
         &mut self,
         tool_call_id: acp::ToolCallId,
@@ -1874,15 +2183,11 @@ impl ThreadView {
         if step >= state.answers.len() {
             state.answers.resize(step + 1, String::new());
         }
-        state.answers[step] = answer.clone();
+        state.answers[step] = answer;
 
         let is_last = step + 1 >= question_count;
-        if is_last {
-            let answers = state.answers.clone();
-            self.questionnaire_states.remove(&tool_call_id);
-            self.thread.update(cx, |thread, cx| {
-                thread.answer_questions(tool_call_id, answers, cx);
-            });
+        let answers = if is_last {
+            Some(state.answers.clone())
         } else {
             state.current_step += 1;
             let next_answer = state.answers.get(state.current_step).cloned().unwrap_or_default();
@@ -1890,6 +2195,11 @@ impl ThreadView {
                 editor.set_text(next_answer, window, cx);
             });
             cx.notify();
+            None
+        };
+
+        if let Some(answers) = answers {
+            self.complete_questionnaire(tool_call_id, answers, window, cx);
         }
     }
 
@@ -1918,12 +2228,8 @@ impl ThreadView {
         state.answers[step] = input_text;
 
         let is_last = step + 1 >= question_count;
-        if is_last {
-            let answers = state.answers.clone();
-            self.questionnaire_states.remove(&tool_call_id);
-            self.thread.update(cx, |thread, cx| {
-                thread.answer_questions(tool_call_id, answers, cx);
-            });
+        let answers = if is_last {
+            Some(state.answers.clone())
         } else {
             state.current_step += 1;
             let next_answer = state.answers.get(state.current_step).cloned().unwrap_or_default();
@@ -1931,6 +2237,11 @@ impl ThreadView {
                 editor.set_text(next_answer, window, cx);
             });
             cx.notify();
+            None
+        };
+
+        if let Some(answers) = answers {
+            self.complete_questionnaire(tool_call_id, answers, window, cx);
         }
     }
 
@@ -4141,31 +4452,32 @@ impl ThreadView {
 
     fn render_active_questionnaire(&self, cx: &Context<Self>) -> Option<Div> {
         // Show the first pending questionnaire as a card above the input area.
-        let (tool_call_id, state) = self.questionnaire_states.iter().next()?;
+        let (tool_call_id, _state) = self.questionnaire_states.iter().next()?;
 
-        // Look up the questions from the thread entries.
-        let thread = self.thread.read(cx);
-        let questions: Vec<acp_thread::UserQuestion> = thread
-            .entries()
-            .iter()
-            .find_map(|entry| {
-                if let acp_thread::AgentThreadEntry::ToolCall(tc) = entry {
-                    if &tc.id == tool_call_id {
-                        if let acp_thread::ToolCallStatus::WaitingForQuestionAnswer {
-                            questions,
-                            ..
-                        } = &tc.status
-                        {
-                            return Some(questions.clone());
+        let questions = if let Some(questions) = self.local_questionnaire_questions.get(tool_call_id)
+        {
+            questions.clone()
+        } else {
+            let thread = self.thread.read(cx);
+            thread
+                .entries()
+                .iter()
+                .find_map(|entry| {
+                    if let acp_thread::AgentThreadEntry::ToolCall(tc) = entry {
+                        if &tc.id == tool_call_id {
+                            if let acp_thread::ToolCallStatus::WaitingForQuestionAnswer {
+                                questions,
+                                ..
+                            } = &tc.status
+                            {
+                                return Some(questions.clone());
+                            }
                         }
                     }
-                }
-                None
-            })
-            .unwrap_or_else(|| {
-                // Fallback: pull questions from the state itself if available.
-                Vec::new()
-            });
+                    None
+                })
+                .unwrap_or_default()
+        };
 
         if questions.is_empty() {
             // Questions not yet in thread entries — still initialising, show pending card.
